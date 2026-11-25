@@ -143,6 +143,36 @@ ebook-convert input.azw3 output.epub --output-profile tablet
 
 ---
 
+## Where files go, and why books go missing
+
+The device's library index **only covers two folders**:
+
+```
+/storage/emulated/0/Books     ← 162 indexed books (measured)
+/storage/emulated/0/Push      ← 136 indexed books
+```
+
+Anything saved elsewhere — most often `/storage/emulated/0` itself, where a
+transfer naturally lands — is **on the device but invisible to the Library**,
+because NeoReader never indexed it. There is no public rescan endpoint.
+
+Two features deal with this:
+
+**1. Uploads default to `Books/`**, not the root. The destination in the Transfer
+view is an **editable field** with a **Pick…** button that opens a real folder
+browser, so you can send files anywhere without them being stranded.
+
+**2. Library → "Browse folder…"** scans any folder (recursively, 3 levels) for
+book files and shows them in the same grid, with format badges and working
+reader support. This is how you reach books the library index doesn't know
+about.
+
+Covers for these un-indexed books are generated client-side: EPUBs have their
+`cover-image` / `<meta name="cover">` extracted from the package, and PDFs get
+their first page rendered and cached. (The device's own
+`/api/storage/thumbnail` endpoint is unreliable for arbitrary paths — it often
+returns the whole file or a 500.)
+
 ## Caching
 
 The device API is slow: `/api/library/tree` takes **~1.6 s**, and the library

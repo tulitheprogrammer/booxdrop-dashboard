@@ -152,7 +152,12 @@
       <div class="panel">
         <div class="panel-h">
           <h2>Send a file to the device</h2>
-          <div class="right"><span style="font-size:12px;color:var(--dim)" id="upDest">/storage/emulated/0</span></div>
+          <div class="right dest-wrap">
+            <label for="upDest" class="dest-lbl">Send to</label>
+            <input id="upDest" class="dest-input" spellcheck="false" autocomplete="off"
+                   value="/storage/emulated/0/Books" title="Destination folder on the device">
+            <button class="btn" id="upDestPick" title="Pick a folder from the device">Pick…</button>
+          </div>
         </div>
         <div id="dropzone" class="drop">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 16V4"/><path d="M7.5 8.5 12 4l4.5 4.5"/><path d="M4 16v2.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V16"/></svg>
@@ -168,7 +173,25 @@
 </div>
 
 <div id="toasts"></div>
-<script src="app.js"></script>
+<!-- folder picker -->
+  <div id="picker" class="picker" hidden>
+    <div class="picker-box" role="dialog" aria-modal="true" aria-labelledby="pickerTitle">
+      <div class="picker-h">
+        <h3 id="pickerTitle">Choose a folder</h3>
+        <button class="picker-x" id="pickerClose" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <div class="picker-path" id="pickerPath"></div>
+      <div class="picker-list" id="pickerList"></div>
+      <div class="picker-f">
+        <button class="btn" id="pickerUp">Up one level</button>
+        <button class="btn primary" id="pickerUse">Use this folder</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
 <script src="reader.js"></script>
 </body>
 </html>

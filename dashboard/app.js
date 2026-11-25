@@ -11,7 +11,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const state = {
   base: localStorage.getItem('boox.base') || 'http://192.0.2.10:8085',
   view: 'overview',
-  path: '/storage/emulated/0',
+  path: '/storage/emulated/0/Books',   // uploads default where the library index looks
   entries: [],
   mediaType: 'Recent',
   online: false,
@@ -432,6 +432,224 @@ state.books = [];
 state.libOffset = 0;
 state.libTotal = 0;
 
+
+/* ---------------- folder scan ----------------
+   The device's library index only covers Books/ and Push/. Files saved anywhere
+   else (most often the root, where Transfer defaults to) are invisible to the
+   Library view. This walks a folder and turns book files into library-shaped
+   entries so the same grid and reader can show them. */
+const BOOK_EXT = /\.(pdf|epub|mobi|azw3?|fb2|djvu|cbz|cbr)$/i;
+
+async function scanFolder(dir, depth = 0, out = [], seen = new Set()) {
+  if (depth > 3 || out.length > 900) return out;
+  let r;
+  try {
+    r = await api('/api/storage', { args: { dir, refresh: false } });
+  } catch { return out; }
+  const d = r.data || r;
+  const entries = d.list || [];
+  for (const e of entries) {
+    if (e.dir) {
+      if (!seen.has(e.path)) { seen.add(e.path); await scanFolder(e.path, depth + 1, out, seen); }
+    } else if (BOOK_EXT.test(e.name)) {
+      out.push(e);
+    }
+  }
+  return out;
+}
+
+
+/* Render page 1 of a PDF to a small data-URL cover. Cached in localStorage so a
+   folder revisit doesn't re-download the whole file. */
+const PDF_COVER_KEY = (path) => 'boox.pdfcover.v1:' + path;
+
+async function pdfCover(entry) {
+  const key = PDF_COVER_KEY(entry.path);
+  try {
+    const hit = localStorage.getItem(key);
+    if (hit) return hit;
+  } catch { /* ignore */ }
+
+  try {
+    const pdfjs = await import('./vendor/pdf.min.mjs');
+    pdfjs.GlobalWorkerOptions.workerSrc = './vendor/pdf.worker.min.mjs';
+    const resp = await fetch(`${state.base}/api/storage/file?args=${enc(entry.path)}`);
+    if (!resp.ok) return null;
+    const data = new Uint8Array(await resp.arrayBuffer());
+    const doc = await pdfjs.getDocument({ data, isEvalSupported: false }).promise;
+    const page = await doc.getPage(1);
+    const base = page.getViewport({ scale: 1 });
+    const scale = Math.min(300 / base.width, 400 / base.height, 1);
+    const vp = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.floor(vp.width));
+    canvas.height = Math.max(1, Math.floor(vp.height));
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    await page.render({ canvasContext: ctx, viewport: vp }).promise;
+    const url = canvas.toDataURL('image/jpeg', 0.72);
+    try { localStorage.setItem(key, url); } catch { /* quota */ }
+    return url;
+  } catch { return null; }
+}
+
+/* Build a real cover for an EPUB by parsing its package metadata. */
+async function epubCover(entry) {
+  try {
+    if (!window.JSZip) {
+      await new Promise((res, rej) => {
+        const sc = document.createElement('script');
+        sc.src = './vendor/jszip.min.js';
+        sc.onload = res; sc.onerror = rej;
+        document.head.appendChild(sc);
+      });
+    }
+    const resp = await fetch(`${state.base}/api/storage/file?args=${enc(entry.path)}`);
+    if (!resp.ok) return null;
+    const zip = await window.JSZip.loadAsync(await resp.arrayBuffer());
+
+    // find OPF
+    let opfPath = null;
+    const cont = zip.file('META-INF/container.xml');
+    if (cont) {
+      const ct = await cont.async('string');
+      opfPath = (ct.match(/full-path="([^"]+)"/) || [])[1] || null;
+    }
+    if (!opfPath) {
+      opfPath = Object.keys(zip.files).find((n) => /\.opf$/i.test(n) && !zip.files[n].dir) || null;
+    }
+    if (!opfPath) return null;
+    const opfDir = opfPath.slice(0, opfPath.lastIndexOf('/') + 1);
+    const opf = await zip.file(opfPath).async('string');
+    const dom = new DOMParser().parseFromString(opf, 'application/xml');
+
+    // EPUB3: manifest item with properties="cover-image"
+    let href = null;
+    for (const it of dom.getElementsByTagName('*')) {
+      const tag = (it.localName || '').toLowerCase();
+      if (tag !== 'item') continue;
+      if ((it.getAttribute('properties') || '').includes('cover-image')) {
+        href = it.getAttribute('href');
+        break;
+      }
+    }
+    // EPUB2: <meta name="cover" content="id">
+    if (!href) {
+      let coverId = null;
+      for (const m of dom.getElementsByTagName('*')) {
+        if ((m.localName || '').toLowerCase() === 'meta' &&
+            (m.getAttribute('name') || '').toLowerCase() === 'cover') {
+          coverId = m.getAttribute('content');
+          break;
+        }
+      }
+      if (coverId) {
+        for (const it of dom.getElementsByTagName('*')) {
+          if ((it.localName || '').toLowerCase() === 'item' && it.getAttribute('id') === coverId) {
+            href = it.getAttribute('href');
+            break;
+          }
+        }
+      }
+    }
+    // fall back to any image whose name looks like a cover
+    if (!href) {
+      const cand = Object.keys(zip.files).find((n) => /cover/i.test(n) && /\.(jpe?g|png|gif|webp)$/i.test(n));
+      if (cand) href = cand.slice(opfDir.length);
+    }
+    if (!href) return null;
+
+    const rel = href.startsWith('/') ? href.slice(1) : href;
+    const full = (opfDir + rel).split('/').reduce((acc, seg) => {
+      if (seg === '..') acc.pop();
+      else if (seg !== '.' && seg !== '') acc.push(seg);
+      return acc;
+    }, []).join('/');
+
+    const f = zip.file(full);
+    if (!f) return null;
+    const blob = await f.async('blob');
+    return await new Promise((res) => {
+      const fr = new FileReader();
+      fr.onload = () => res(fr.result);
+      fr.onerror = () => res(null);
+      fr.readAsDataURL(blob);
+    });
+  } catch { return null; }
+}
+
+/* Convert a storage entry into the shape renderBooks/renderChips expect. */
+function folderEntryToBook(e) {
+  return {
+    name: e.name,
+    progressPercent: '',
+    metadata: { _id: e.path, createdAt: e.updatedAt || '', authorList: [] },
+    coverPath: '',
+  };
+}
+
+async function loadFolderBooks(dir) {
+  const grid = $('#books');
+  grid.innerHTML = '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+  try {
+    const files = await scanFolder(dir);
+    state.folderBooks = files.map(folderEntryToBook);
+    state.books = state.folderBooks;
+    state.libTotal = state.books.length;
+    renderBooks();
+    if (!state.books.length) {
+      grid.innerHTML = emptyBox(`No books found in ${dir}`);
+      return;
+    }
+    // Fill in real EPUB covers in the background (max 24 so big folders stay fast).
+    const epubs = state.folderBooks.filter((b) => /\.epub$/i.test(b.name)).slice(0, 24);
+    for (const b of epubs) {
+      if (state.shelf !== 'folder') return;
+      const cover = await epubCover({ path: b.metadata._id });
+      if (cover) {
+        b._cover = cover;
+        const idx = state.books.indexOf(b);
+        if (idx >= 0) {
+          const card = grid.children[idx];
+          const cov = card && card.querySelector('.cover');
+          if (cov && !cov.querySelector('img')) {
+            const img = document.createElement('img');
+            img.alt = '';
+            img.src = cover;
+            cov.insertBefore(img, cov.firstChild);
+            const t = cov.querySelector('.t');
+            if (t) t.remove();
+          }
+        }
+      }
+    }
+
+    // PDF covers need a full download each, so do a smaller batch.
+    const pdfs = state.folderBooks.filter((b) => /\.pdf$/i.test(b.name)).slice(0, 8);
+    for (const b of pdfs) {
+      if (state.shelf !== 'folder') return;
+      const cover = await pdfCover({ path: b.metadata._id });
+      if (!cover) continue;
+      b._cover = cover;
+      const idx = state.books.indexOf(b);
+      if (idx < 0) continue;
+      const card = grid.children[idx];
+      const cov = card && card.querySelector('.cover');
+      if (cov && !cov.querySelector('img')) {
+        const img = document.createElement('img');
+        img.alt = '';
+        img.src = cover;
+        cov.insertBefore(img, cov.firstChild);
+        const t = cov.querySelector('.t');
+        if (t) t.remove();
+      }
+    }
+  } catch {
+    grid.innerHTML = emptyBox('Could not scan folder');
+  }
+}
+
 async function loadLibrary() {
   const shelves = $('#shelves'), grid = $('#books');
   grid.innerHTML = '<div class="skel"></div><div class="skel"></div>';
@@ -449,6 +667,14 @@ async function loadLibrary() {
       .sort((a, b) => b.bookCount - a.bookCount);
     const total = state.shelves.reduce((a, c) => a + c.bookCount, 0);
     const chips = [{ name: 'All books', bookCount: total, uid: 'all' }].concat(state.shelves);
+    // The device only indexes Books/ and Push/ into its library. Anything saved
+    // elsewhere (e.g. a Transfer into /storage/emulated/0 root) never appears in
+    // a shelf, so offer a direct folder browser for those.
+    chips.push({
+      name: 'Browse folder…',
+      bookCount: state.folderBooks ? state.folderBooks.length : 0,
+      uid: 'folder',
+    });
     chips.forEach((c) => {
       const b = document.createElement('button');
       b.className = 'chip' + (c.uid === state.shelf ? ' on' : '');
@@ -456,6 +682,13 @@ async function loadLibrary() {
       b.onclick = () => {
         state.shelf = c.uid;
         $$('.chip', shelves).forEach((x) => x.classList.toggle('on', x === b));
+        if (c.uid === 'folder') {
+          openPicker(state.folderPath || '/storage/emulated/0', (dir) => {
+            state.folderPath = dir;
+            loadFolderBooks(dir);
+          });
+          return;
+        }
         loadShelf();
       };
       shelves.appendChild(b);
@@ -543,6 +776,9 @@ async function loadShelf() {
       });
       state.books.sort((a, b) => (b.metadata?.createdAt || '').localeCompare(a.metadata?.createdAt || ''));
       state.libTotal = state.books.length;
+    } else if (state.shelf === 'folder') {
+      state.books = state.folderBooks || [];
+      state.libTotal = state.books.length;
     } else {
       const r = await getLibrary(state.shelf, 0, SHELF_LIMIT);
       state.books = r.visibleBookList || r.data?.visibleBookList || [];
@@ -555,6 +791,7 @@ async function loadShelf() {
 }
 
 function coverFor(b) {
+  if (b._cover) return b._cover;
   if (b.coverPath) return thumbURL(b.coverPath);
   const mc = b.metadata?.bookCovers;
   if (mc && typeof mc === 'object') {
@@ -640,8 +877,70 @@ async function loadMedia() {
 }
 
 /* ---------------- transfer ---------------- */
+
+/* ---------------- folder picker ----------------
+   A real browser for device folders. The previous UI had a static destination
+   label with no way to change it, so uploads were stuck at whatever the Files
+   view happened to be showing. */
+let pickerDir = '/storage/emulated/0';
+let pickerOnPick = null;
+
+function openPicker(startDir, onPick) {
+  pickerOnPick = onPick;
+  pickerDir = startDir || '/storage/emulated/0';
+  const el = $('#picker');
+  if (!el) return;
+  el.hidden = false;
+  loadPickerDir(pickerDir);
+}
+
+function closePicker() {
+  const el = $('#picker');
+  if (el) el.hidden = true;
+  pickerOnPick = null;
+}
+
+function pickerParent(dir) {
+  const parts = dir.split('/').filter(Boolean);
+  if (parts.length <= 1) return '/storage/emulated/0';
+  parts.pop();
+  return '/' + parts.join('/');
+}
+
+async function loadPickerDir(dir) {
+  pickerDir = dir;
+  $('#pickerPath').textContent = dir;
+  const list = $('#pickerList');
+  list.innerHTML = '<div class="picker-empty">Loading…</div>';
+  try {
+    const r = await api('/api/storage', { args: { dir, refresh: false } });
+    const d = r.data || r;
+    const dirs = (d.list || []).filter((e) => e.dir)
+      .sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+    list.innerHTML = '';
+    if (!dirs.length) {
+      list.innerHTML = '<div class="picker-empty">No sub-folders here</div>';
+      return;
+    }
+    for (const e of dirs) {
+      const b = document.createElement('button');
+      b.className = 'picker-item';
+      b.innerHTML = `${ICON.folder}<span class="n"></span><span class="c">open</span>`;
+      b.querySelector('.n').textContent = e.name;
+      b.onclick = () => loadPickerDir(e.path);
+      list.appendChild(b);
+    }
+  } catch {
+    list.innerHTML = '<div class="picker-empty">Could not read this folder</div>';
+  }
+}
+
 function renderDest() {
-  $('#upDest').textContent = state.path;
+  const el = $('#upDest');
+  if (!el) return;
+  const dir = state.upDir || state.path;
+  el.textContent = dir;
+  el.title = dir;
 }
 async function doUpload(files) {
   const list = [...files];
@@ -653,7 +952,7 @@ async function doUpload(files) {
     $('#ups').prepend(row);
     const pct = row.querySelector('.p');
     try {
-      await uploadFile(f, state.path, (p) => { pct.textContent = p + '%'; });
+      await uploadFile(f, state.upDir || state.path, (p) => { pct.textContent = p + '%'; });
       row.classList.add('done'); pct.textContent = 'done';
       invalidateLibrary();
       toast(`Sent ${f.name}`, 'ok');
@@ -701,6 +1000,41 @@ function boot() {
     if (state.view === 'library') loadLibrary();
     else loadFiles();
   };  $('#btnBrowse').onclick = () => $('#upFilename').click();
+
+  // destination: editable + picker
+  const destInput = $('#upDest');
+  if (destInput) {
+    destInput.value = state.path;
+    destInput.onchange = () => {
+      const v = destInput.value.trim();
+      state.upDir = v || state.path;
+      renderDest();
+    };
+  }
+  const pickBtn = $('#upDestPick');
+  if (pickBtn) pickBtn.onclick = () => {
+    openPicker(state.upDir || state.path, (dir) => {
+      state.upDir = dir;
+      if (destInput) destInput.value = dir;
+      renderDest();
+      toast('Uploads will go to ' + dir, 'info');
+    });
+  };
+  const pc = $('#pickerClose');
+  if (pc) pc.onclick = closePicker;
+  const pu = $('#pickerUp');
+  if (pu) pu.onclick = () => loadPickerDir(pickerParent(pickerDir));
+  const puse = $('#pickerUse');
+  if (puse) puse.onclick = () => {
+    if (pickerOnPick) pickerOnPick(pickerDir);
+    closePicker();
+  };
+  const pk = $('#picker');
+  if (pk) pk.onclick = (e) => { if (e.target === pk) closePicker(); };
+  document.addEventListener('keydown', (e) => {
+    const el = $('#picker');
+    if (el && !el.hidden && e.key === 'Escape') { e.stopPropagation(); closePicker(); }
+  }, true);
   $('#upFilename').onchange = (e) => { doUpload(e.target.files); e.target.value = ''; };
 
   const dz = $('#dropzone');
